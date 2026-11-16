@@ -3,36 +3,26 @@ import sqlite3
 import secrets
 import string
 from datetime import datetime, timedelta
+from contextlib import contextmanager
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uvicorn
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import Message
+import asyncio
 
-import telebot
-from telebot import types
-
-# === НАСТРОЙКИ (всё вшито в код) ===
+# === НАСТРОЙКИ (всё вшито) ===
 BOT_TOKEN = "9200973387:AAHMW82BjFLOFoK2K3DgZjYEtQDzvr1iWJo"
 ADMIN_ID = 7922416281
-
 DB_PATH = "keys.db"
 
-# === FASTAPI ===
-app = FastAPI(title="Luno Cheats Auth")
-
-class CheckKeyRequest(BaseModel):
-    key: str
-    hwid: str
-
-class CheckKeyResponse(BaseModel):
-    valid: bool
-    message: str
+# Инициализация бота и диспетчера
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
 # === БАЗА ДАННЫХ ===
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 def init_db():
@@ -50,35 +40,34 @@ def init_db():
         """)
         conn.commit()
 
-# === API ENDPOINTS ===
-@app.post("/api/check_key", response_model=CheckKeyResponse)
-def check_key(req: CheckKeyRequest):
-    key = req.key.upper().strip()
-    hwid = req.hwid.strip()
-
+# === ЛОГИКА ПРОВЕРКИ КЛЮЧА ===
+def check_key_logic(key: str, hwid: str):
+    key = key.upper().strip()
+    hwid = hwid.strip()
+    
     if len(key) != 16 or not all(c in string.ascii_uppercase + string.digits for c in key):
-        raise HTTPException(status_code=400, detail="invalid key format")
+        return False, "invalid_key_format"
 
     with get_db() as conn:
         row = conn.execute("SELECT * FROM keys WHERE key = ?", (key,)).fetchone()
-
+        
         if not row:
-            raise HTTPException(status_code=403, detail="ключ не найден")
-
+            return False, "key_not_found"
+        
         if row["banned"] == 1:
-            raise HTTPException(status_code=403, detail="ключ заблокирован")
-
+            return False, "key_banned"
+        
         if row["activated"] == 1:
             if row["hwid"] != hwid:
-                raise HTTPException(status_code=403, detail="ключ уже активирован на другом устройстве")
+                return False, "hwid_mismatch"
             
             activated_at = datetime.fromisoformat(row["activated_at"])
             expires_at = activated_at + timedelta(days=row["duration_days"])
             if datetime.utcnow() > expires_at:
-                raise HTTPException(status_code=403, detail="срок действия ключа истёк")
+                return False, "key_expired"
             
-            return CheckKeyResponse(valid=True, message="добро пожаловать обратно")
-
+            return True, "welcome_back"
+        
         # Первая активация
         now = datetime.utcnow().isoformat()
         conn.execute(
@@ -86,140 +75,128 @@ def check_key(req: CheckKeyRequest):
             (hwid, now, key)
         )
         conn.commit()
+        return True, f"activated_{row['duration_days']}_days"
 
-        return CheckKeyResponse(valid=True, message=f"активация успешна, срок {row['duration_days']} дней")
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-# === TELEGRAM BOT ===
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
-
-def is_admin(message):
-    return message.from_user.id == ADMIN_ID
-
-@bot.message_handler(commands=["start"])
-def cmd_start(message):
-    if not is_admin(message):
+# === ОБРАБОТЧИКИ ДЛЯ ТЕБЯ (АДМИНА) ===
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    if message.from_user.id != ADMIN_ID:
         return
-    bot.reply_to(message, "Бот управления ключами luno_cheats\n\n"
-        "/addkey <дней> — создать ключ (пример: /addkey 30)\n"
-        "/revoke <ключ> — удалить ключ\n"
-        "/ban <ключ> — заблокировать ключ\n"
-        "/list — список последних 30 ключей\n"
-        "/stats — статистика")
+    await message.answer(
+        "Бот управления luno_cheats\n\n"
+        "/add <дней> — создать ключ\n"
+        "/ban <ключ> — заблокировать\n"
+        "/delete <ключ> — удалить\n"
+        "/list — список ключей"
+    )
 
-@bot.message_handler(commands=["addkey"])
-def cmd_addkey(message):
-    if not is_admin(message):
+@dp.message(Command("add"))
+async def cmd_add(message: Message):
+    if message.from_user.id != ADMIN_ID:
         return
     args = message.text.split()
     if len(args) != 2:
-        bot.reply_to(message, "Использование: /addkey <дней>")
+        await message.answer("Использование: /add <дней>")
         return
     try:
         days = int(args[1])
     except ValueError:
-        bot.reply_to(message, "дни должны быть числом")
+        await message.answer("дни должны быть числом")
         return
-
+    
     key = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))
     now = datetime.utcnow().isoformat()
-
+    
     with get_db() as conn:
-        conn.execute(
-            "INSERT INTO keys (key, duration_days, created_at) VALUES (?, ?, ?)",
-            (key, days, now)
-        )
+        conn.execute("INSERT INTO keys (key, duration_days, created_at) VALUES (?, ?, ?)", (key, days, now))
         conn.commit()
+    
+    await message.answer(f"✓ Ключ создан:\n`{key}`\nСрок: {days} дней", parse_mode="Markdown")
 
-    bot.reply_to(message, f"✓ Ключ создан:\n`{key}`\nСрок: {days} дней")
-
-@bot.message_handler(commands=["revoke"])
-def cmd_revoke(message):
-    if not is_admin(message):
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if message.from_user.id != ADMIN_ID:
         return
     args = message.text.split()
     if len(args) != 2:
-        bot.reply_to(message, "Использование: /revoke <ключ>")
+        await message.answer("Использование: /ban <ключ>")
         return
     key = args[1].upper()
-
-    with get_db() as conn:
-        conn.execute("DELETE FROM keys WHERE key = ?", (key,))
-        conn.commit()
-
-    bot.reply_to(message, f"✓ Ключ `{key}` отозван")
-
-@bot.message_handler(commands=["ban"])
-def cmd_ban(message):
-    if not is_admin(message):
-        return
-    args = message.text.split()
-    if len(args) != 2:
-        bot.reply_to(message, "Использование: /ban <ключ>")
-        return
-    key = args[1].upper()
-
     with get_db() as conn:
         conn.execute("UPDATE keys SET banned = 1 WHERE key = ?", (key,))
         conn.commit()
+    await message.answer(f"✓ Ключ `{key}` заблокирован", parse_mode="Markdown")
 
-    bot.reply_to(message, f"✓ Ключ `{key}` заблокирован")
+@dp.message(Command("delete"))
+async def cmd_delete(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Использование: /delete <ключ>")
+        return
+    key = args[1].upper()
+    with get_db() as conn:
+        conn.execute("DELETE FROM keys WHERE key = ?", (key,))
+        conn.commit()
+    await message.answer(f"✓ Ключ `{key}` удалён", parse_mode="Markdown")
 
-@bot.message_handler(commands=["list"])
-def cmd_list(message):
-    if not is_admin(message):
+@dp.message(Command("list"))
+async def cmd_list(message: Message):
+    if message.from_user.id != ADMIN_ID:
         return
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT key, duration_days, activated, hwid, banned FROM keys ORDER BY created_at DESC LIMIT 30"
-        ).fetchall()
-
+        rows = conn.execute("SELECT key, duration_days, activated, hwid, banned FROM keys ORDER BY created_at DESC LIMIT 20").fetchall()
     if not rows:
-        bot.reply_to(message, "Ключей нет")
+        await message.answer("Ключей нет")
         return
+    msg = "Последние 20 ключей:\n\n"
+    for r in rows:
+        st = "🔴" if r["banned"] else ("🟢" if r["activated"] else "⚪")
+        msg += f"`{r['key']}` | {r['duration_days']}д | {st}\n"
+    await message.answer(msg, parse_mode="Markdown")
 
-    msg = "Последние 30 ключей:\n\n"
-    for row in rows:
-        status = "🔴 забанен" if row["banned"] else ("🟢 активен" if row["activated"] else "⚪ свободен")
-        hwid_short = row["hwid"][:8] + "..." if row["hwid"] else "-"
-        msg += f"`{row['key']}` | {row['duration_days']}д | {status} | {hwid_short}\n"
-
-    bot.reply_to(message, msg)
-
-@bot.message_handler(commands=["stats"])
-def cmd_stats(message):
-    if not is_admin(message):
+# === ОБРАБОТЧИК ЗАПРОСОВ ОТ ЛАУНЧЕРА ===
+# Лаунчер шлёт сообщение с текстом: CHECK_KEY|<KEY>|<HWID>
+# Бот отвечает: OK|<MESSAGE> или ERR|<REASON>
+@dp.message()
+async def handle_launcher_request(message: Message):
+    text = message.text.strip()
+    if not text.startswith("CHECK_KEY|"):
         return
-    with get_db() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
-        active = conn.execute("SELECT COUNT(*) FROM keys WHERE activated = 1").fetchone()[0]
-        banned = conn.execute("SELECT COUNT(*) FROM keys WHERE banned = 1").fetchone()[0]
-        free = total - active - banned
+    
+    parts = text.split("|")
+    if len(parts) != 3:
+        return
+    
+    _, key, hwid = parts
+    valid, result_code = check_key_logic(key, hwid)
+    
+    response_map = {
+        "welcome_back": "OK|добро пожаловать обратно",
+        "activated_30_days": "OK|активация успешна, срок 30 дней",
+        "activated_7_days": "OK|активация успешна, срок 7 дней",
+        "activated_1_days": "OK|активация успешна, срок 1 дней",
+        "key_not_found": "ERR|ключ не найден",
+        "key_banned": "ERR|ключ заблокирован",
+        "hwid_mismatch": "ERR|ключ уже активирован на другом устройстве",
+        "key_expired": "ERR|срок действия истёк",
+        "invalid_key_format": "ERR|неверный формат ключа"
+    }
+    
+    # Форматируем сообщение об активации с правильным количеством дней
+    if result_code.startswith("activated_"):
+        days = result_code.replace("activated_", "").replace("_days", "")
+        resp_text = f"OK|активация успешна, срок {days} дней"
+    else:
+        resp_text = response_map.get(result_code, "ERR|unknown_error")
+    
+    await bot.send_message(chat_id=message.chat.id, text=resp_text)
 
-    bot.reply_to(message, f"📊 Статистика:\n\n"
-        f"Всего: {total}\n"
-        f"Активных: {active}\n"
-        f"Свободных: {free}\n"
-        f"Забанено: {banned}")
-
-# === ЗАПУСК ===
-def run_bot():
-    print("Telegram bot started...")
-    bot.infinity_polling()
+async def main():
+    init_db()
+    print("Бот запущен. Жду запросы...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    init_db()
-    print("=== Luno Cheats Auth Server ===")
-    print(f"Bot token: {BOT_TOKEN[:10]}...")
-    print(f"Admin ID: {ADMIN_ID}")
-    
-    import threading
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-
-    port = int(os.environ.get("PORT", 8080))
-    print(f"Starting FastAPI on port {port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    asyncio.run(main())
