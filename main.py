@@ -3,7 +3,6 @@ import sqlite3
 import secrets
 import string
 from datetime import datetime, timedelta
-from contextlib import contextmanager
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -12,10 +11,9 @@ import uvicorn
 import telebot
 from telebot import types
 
-# === НАСТРОЙКИ (твои данные) ===
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "9200973387:AAHMW82BjFLOFoK2K3DgZjYEtQDzvr1iWJo")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "7922416281"))
-API_SECRET = os.environ.get("API_SECRET", secrets.token_hex(32))
+# === НАСТРОЙКИ (всё вшито в код) ===
+BOT_TOKEN = "9200973387:AAHMW82BjFLOFoK2K3DgZjYEtQDzvr1iWJo"
+ADMIN_ID = 7922416281
 
 DB_PATH = "keys.db"
 
@@ -215,6 +213,7 @@ def run_bot():
 if __name__ == "__main__":
     init_db()
     print("=== Luno Cheats Auth Server ===")
+    print(f"Bot token: {BOT_TOKEN[:10]}...")
     print(f"Admin ID: {ADMIN_ID}")
     
     import threading
